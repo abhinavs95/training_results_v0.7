@@ -756,6 +756,7 @@ def main():
             eval_dataset_future = pool.submit(create_eval_dataset, args, worker_init_fn=worker_init)
 
         while global_step < args.max_steps and not end_training:
+
             mlperf_logger.log_start(key=mlperf_logger.constants.EPOCH_START,
                                     metadata={'epoch_num': epoch}, sync=False)
             mlperf_logger.log_start(key=mlperf_logger.constants.BLOCK_START,
@@ -817,14 +818,25 @@ def main():
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init_fn=worker_init)
 
                 for step, batch in enumerate(train_dataloader):
+
+                    if global_step == 10:
+                        print("Profiling began at step {}".format(global_step))
+                        torch.cuda.cudart().cudaProfilerStart()
+
+                    torch.cuda.nvtx.range_push("Body of step {}".format(global_step))
+
                     training_steps += 1
                     update_step = training_steps % args.gradient_accumulation_steps == 0
 
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    
+                    torch.cuda.nvtx.range_push("forward")
                     loss, mlm_acc, _ = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
                                     masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
                                     checkpoint_activations=args.checkpoint_activations)
+                    torch.cuda.nvtx.range_pop()
+                    
 
                     divisor = args.gradient_accumulation_steps
                     if args.gradient_accumulation_steps > 1:
@@ -832,16 +844,24 @@ def main():
                             # this division was merged into predivision
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
+                    
+                    torch.cuda.nvtx.range_push("backward")
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                             scaled_loss.backward()
                     else:
                         loss.backward()
+                    torch.cuda.nvtx.range_pop()
+
                     average_loss += loss.item()
 
                     if update_step:
                         lr_scheduler.step()  # learning rate warmup
+                        
+                        torch.cuda.nvtx.range_push("optimizer.step()")
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        torch.cuda.nvtx.range_pop()
+
                         samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * args.n_gpu
 
                         if (args.eval_dir and args.eval_iter_samples > 0 and
@@ -909,6 +929,14 @@ def main():
                                       "timestamp": now_time})
 
                         average_loss = 0
+
+                    torch.cuda.nvtx.range_pop()
+
+                    if global_step >= 20:
+                        print("Profiling ended at step {}".format(global_step))
+                        torch.cuda.cudart().cudaProfilerStop()
+                        end_training = True
+                        break
 
                     if global_step >= args.max_steps or end_training:
                         status = 'success' if converged else 'aborted'

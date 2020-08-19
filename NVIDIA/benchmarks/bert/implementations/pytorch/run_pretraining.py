@@ -609,6 +609,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         had_overflow = scaler.update_scale()
         scaler._overfloat_buf = old_overflow_buf
         # 6. call optimizer step function
+        opt_start = time.time()
         if had_overflow == 0:
             optimizer.step()
             global_step += 1
@@ -618,6 +619,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             if _amp_state.opt_properties.master_weights:
                 for param in optimizer._amp_stash.all_fp32_from_fp16_params:
                     param.grad = None
+        opt_time = time.time() - opt_start
         for param in model.parameters():
             param.grad = None
     else:
@@ -626,7 +628,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             param.grad = None
         global_step += 0 if _amp_state.loss_scalers[0]._has_overflow else 1
 
-    return global_step, ar_time
+    return global_step, ar_time, opt_time
 
 def run_eval(model, eval_dataloader, device, num_eval_examples, first_eval=False, use_cache=False):
     model.eval()
@@ -853,10 +855,8 @@ def main():
 
                     if update_step:
                         lr_scheduler.step()  # learning rate warmup
-                        opt_start = time.time()
-                        global_step, ar_time = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        global_step, ar_time, opt_time = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
                         ar_time_arr.append(ar_time)
-                        opt_time = time.time() - opt_start
                         opt_time_arr.append(opt_time)
                         samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * args.n_gpu
 
@@ -1007,7 +1007,7 @@ def global_batch_size(args):
 if __name__ == "__main__":
 
     now = time.time()
-    args, final_loss, train_time_raw, fw_time_arr, bw_time_arr, opt_time_arr = main()
+    args, final_loss, train_time_raw, fw_time_arr, bw_time_arr, opt_time_arr, ar_time_arr = main()
 
     gpu_count = args.n_gpu
     if torch.distributed.is_initialized():

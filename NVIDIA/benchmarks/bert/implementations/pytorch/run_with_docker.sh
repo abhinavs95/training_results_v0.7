@@ -101,8 +101,10 @@ BERT_CMD="\
     --max_samples_termination=${MAX_SAMPLES_TERMINATION} \
     --eval_iter_start_samples=${EVAL_ITER_START_SAMPLES} --eval_iter_samples=${EVAL_ITER_SAMPLES} \
     --eval_batch_size=16 --eval_dir=/workspace/evaldata \
+    --cache_eval_data \
     --output_dir=/results \
     --fp16 --fused_gelu_bias --dense_seq_output \
+    --fused_mha --unpad \
     --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
     --gradient_accumulation_steps=${GRADIENT_STEPS:-2} \
     --log_freq=1 \

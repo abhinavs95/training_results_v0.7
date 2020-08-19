@@ -593,7 +593,9 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             [master_grads, allreduced_views],
             scaler.loss_scale() / (torch.distributed.get_world_size() * args.gradient_accumulation_steps))
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
+        ar_start = time.time()
         torch.distributed.all_reduce(flat_raw)
+        ar_time = time.time() - ar_start
         # 4. combine unscaling and unflattening of allreduced gradient
         overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
@@ -624,7 +626,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             param.grad = None
         global_step += 0 if _amp_state.loss_scalers[0]._has_overflow else 1
 
-    return global_step
+    return global_step, ar_time
 
 def run_eval(model, eval_dataloader, device, num_eval_examples, first_eval=False, use_cache=False):
     model.eval()
@@ -755,6 +757,11 @@ def main():
         if args.eval_dir:
             eval_dataset_future = pool.submit(create_eval_dataset, args, worker_init_fn=worker_init)
 
+        fw_time_arr = []
+        bw_time_arr = []
+        opt_time_arr = []
+        ar_time_arr = []
+
         while global_step < args.max_steps and not end_training:
             mlperf_logger.log_start(key=mlperf_logger.constants.EPOCH_START,
                                     metadata={'epoch_num': epoch}, sync=False)
@@ -822,26 +829,35 @@ def main():
 
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    fw_start = time.time()
                     loss, mlm_acc, _ = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
                                     masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
                                     checkpoint_activations=args.checkpoint_activations)
-
+                    fw_time = time.time() - fw_start
+                    fw_time_arr.append(fw_time)
                     divisor = args.gradient_accumulation_steps
                     if args.gradient_accumulation_steps > 1:
                         if not args.allreduce_post_accumulation:
                             # this division was merged into predivision
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
+                    bw_start = time.time()
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                             scaled_loss.backward()
                     else:
                         loss.backward()
+                    bw_time = time.time() - bw_start
+                    bw_time_arr.append(bw_time)
                     average_loss += loss.item()
 
                     if update_step:
                         lr_scheduler.step()  # learning rate warmup
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        opt_start = time.time()
+                        global_step, ar_time = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        ar_time_arr.append(ar_time)
+                        opt_time = time.time() - opt_start
+                        opt_time_arr.append(opt_time)
                         samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * args.n_gpu
 
                         if (args.eval_dir and args.eval_iter_samples > 0 and
@@ -970,6 +986,8 @@ def main():
             mlperf_logger.log_end(key=mlperf_logger.constants.EPOCH_STOP,
                                   metadata={'epoch_num': epoch}, sync=False)
             epoch += 1
+
+
         
         mlperf_logger.log_event(key=mlperf_logger.constants.TRAIN_SAMPLES,
                                 value=samples_trained,
@@ -980,7 +998,8 @@ def main():
         mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
                               metadata={'status': status}, sync=False)
 
-    return args, final_loss, train_time_raw
+
+    return args, final_loss, train_time_raw, fw_time_arr, bw_time_arr, opt_time_arr, ar_time_arr
 
 def global_batch_size(args):
     return args.train_batch_size * args.gradient_accumulation_steps * args.n_gpu
@@ -988,7 +1007,7 @@ def global_batch_size(args):
 if __name__ == "__main__":
 
     now = time.time()
-    args, final_loss, train_time_raw = main()
+    args, final_loss, train_time_raw, fw_time_arr, bw_time_arr, opt_time_arr = main()
 
     gpu_count = args.n_gpu
     if torch.distributed.is_initialized():
@@ -999,6 +1018,16 @@ if __name__ == "__main__":
                         * (args.max_steps - args.resume_step + skipped_steps) / train_time_raw
         if args.do_train:
             print({"e2e_time": e2e_time, "training_sequences_per_second": training_perf,
-                                             "final_loss": final_loss, "raw_train_time": train_time_raw })
+                                             "final_loss": final_loss, "raw_train_time": train_time_raw, 
+                                             "mean forward time": np.mean(fw_time_arr),
+                                             "mean backward time": np.mean(bw_time_arr),
+                                             "mean optimizer time": np.mean(opt_time_arr),
+                                             "mean allreduce time": np.mean(ar_time_arr),
+                                             "last forward time": fw_time_arr[-1],
+                                             "last backward time": bw_time_arr[-1],
+                                             "last optimizer time": opt_time_arr[-1],
+                                             "last allreduce time": ar_time_arr[-1]
+                                             })
         else:
             print({"e2e_time": e2e_time})
+
